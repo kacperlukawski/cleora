@@ -6,9 +6,12 @@ use crate::embedding::{calculate_embeddings, calculate_embeddings_mmap};
 use crate::entity::{EntityProcessor, SMALL_VECTOR_SIZE};
 use crate::persistence::embedding::{EmbeddingPersistor, NpyPersistor, TextFileVectorPersistor};
 use crate::persistence::entity::InMemoryEntityMappingPersistor;
-use crate::sparse_matrix::{create_sparse_matrices, SparseMatrix};
-use bus::Bus;
+use crate::sparse_matrix::SparseMatrix;
+use crate::sparse_matrix_builder::create_sparse_matrices_builders;
+use crossbeam::channel;
+use crossbeam::thread as cb_thread;
 use log::{error, info, warn};
+use num_cpus;
 use simdjson_rust::dom;
 use smallvec::{smallvec, SmallVec};
 use std::sync::Arc;
@@ -21,66 +24,75 @@ pub fn build_graphs(
     config: &Configuration,
     in_memory_entity_mapping_persistor: Arc<InMemoryEntityMappingPersistor>,
 ) -> Vec<SparseMatrix> {
-    let sparse_matrices = create_sparse_matrices(&config.columns);
+    let sparse_matrices = create_sparse_matrices_builders(&config.columns);
     dbg!(&sparse_matrices);
 
-    let mut bus: Bus<SmallVec<[u64; SMALL_VECTOR_SIZE]>> = Bus::new(128);
-    let mut sparse_matrix_threads = Vec::new();
-    for mut sparse_matrix in sparse_matrices {
-        let rx = bus.add_rx();
-        let handle = thread::spawn(move || {
-            for received in rx {
-                sparse_matrix.handle_pair(&received);
-            }
-            sparse_matrix.finish();
-            sparse_matrix
-        });
-        sparse_matrix_threads.push(handle);
-    }
+    let sparse_matrices_ref = &sparse_matrices;
 
-    for input in config.input.iter() {
-        let mut entity_processor = EntityProcessor::new(
-            config,
-            in_memory_entity_mapping_persistor.clone(),
-            |hashes| {
-                bus.broadcast(hashes);
-            },
-        );
+    cb_thread::scope(|s| {
+        // Important to have large buffer. Cartesian-product iterator yields a lot of items very fast
+        // and we can easily loose performance on locking there
+        let (sender_main, receiver_main) = channel::bounded(8192);
 
-        match &config.file_type {
-            FileType::Json => {
-                let mut parser = dom::Parser::default();
-                read_file(input, config.log_every_n as u64, move |line| {
-                    let row = parse_json_line(line, &mut parser, &config.columns);
-                    entity_processor.process_row(&row);
-                });
-            }
-            FileType::Tsv => {
-                let config_col_num = config.columns.len();
-                read_file(input, config.log_every_n as u64, move |line| {
-                    let row = parse_tsv_line(line);
-                    let line_col_num = row.len();
-                    if line_col_num == config_col_num {
-                        entity_processor.process_row(&row);
-                    } else {
-                        warn!("Wrong number of columns (expected: {}, provided: {}). The line [{}] is skipped.", config_col_num, line_col_num, line);
+        let worker_num = num_cpus::get();
+        for _ in 0..worker_num {
+            let receiver = receiver_main.clone();
+            s.spawn(move |_| {
+                for hashes in receiver {
+                    let hashes: SmallVec<[u64; SMALL_VECTOR_SIZE]> = hashes;
+                    for sparse_matrix in sparse_matrices_ref {
+                        sparse_matrix.handle_pair(&hashes)
                     }
-                });
+                }
+            });
+        }
+
+        for input in &config.input {
+            let sender = sender_main.clone();
+            let entity_processor = EntityProcessor::new(
+                config,
+                in_memory_entity_mapping_persistor.clone(),
+                move |hashes| {
+                    sender.send(hashes).unwrap();
+                },
+            );
+
+            match &config.file_type {
+                FileType::Json => {
+                    s.spawn(move |_| {
+                        let mut parser = dom::Parser::default();
+                        read_file(input, config.log_every_n as u64, |line| {
+                            let row = parse_json_line(line, &mut parser, &config.columns);
+                            entity_processor.process_row(&row);
+                        })
+                    });
+                }
+                FileType::Tsv => {
+                    let config_col_num = config.columns.len();
+                    s.spawn(move |_| {
+                        read_file(input, config.log_every_n as u64, |line| {
+                            let row = parse_tsv_line(line);
+                            let line_col_num = row.len();
+                            if line_col_num == config_col_num {
+                                entity_processor.process_row(&row);
+                            } else {
+                                warn!("Wrong number of columns (expected: {}, provided: {}). The line [{}] is skipped.", config_col_num, line_col_num, line);
+                            }
+                        });
+                    });
+                }
             }
         }
-    }
 
-    drop(bus);
-
-    let mut sparse_matrices = vec![];
-    for join_handle in sparse_matrix_threads {
-        let sparse_matrix = join_handle
-            .join()
-            .expect("Couldn't join on the associated thread");
-        sparse_matrices.push(sparse_matrix);
-    }
+        // Drop it so all channels are closed when work is finished
+        drop(sender_main);
+        drop(receiver_main);
+    }).expect("Threads finished work");
 
     sparse_matrices
+        .into_iter()
+        .map(|smb| smb.finish())
+        .collect()
 }
 
 /// Read file line by line. Pass every valid line to handler for parsing.
