@@ -1,3 +1,4 @@
+use std::cmp::min;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
@@ -34,8 +35,8 @@ pub fn build_graphs(
         // and we can easily loose performance on locking there
         let (sender_main, receiver_main) = channel::bounded(8192);
 
-        let worker_num = num_cpus::get();
-        for _ in 0..worker_num {
+        let processing_worker_num = num_cpus::get();
+        for _ in 0..processing_worker_num {
             let receiver = receiver_main.clone();
             s.spawn(move |_| {
                 for hashes in receiver {
@@ -47,39 +48,54 @@ pub fn build_graphs(
             });
         }
 
-        for input in &config.input {
-            let sender = sender_main.clone();
-            let entity_processor = EntityProcessor::new(
-                config,
-                in_memory_entity_mapping_persistor.clone(),
-                move |hashes| {
-                    sender.send(hashes).unwrap();
-                },
-            );
+        {
+            let (files_s, files_r) = channel::unbounded();
+            for input in &config.input {
+                files_s.send(input).unwrap()
+            }
 
-            match &config.file_type {
-                FileType::Json => {
-                    s.spawn(move |_| {
-                        let mut parser = dom::Parser::default();
-                        read_file(input, config.log_every_n as u64, |line| {
-                            let row = parse_json_line(line, &mut parser, &config.columns);
-                            entity_processor.process_row(&row);
-                        })
-                    });
-                }
-                FileType::Tsv => {
-                    let config_col_num = config.columns.len();
-                    s.spawn(move |_| {
-                        read_file(input, config.log_every_n as u64, |line| {
-                            let row = parse_tsv_line(line);
-                            let line_col_num = row.len();
-                            if line_col_num == config_col_num {
-                                entity_processor.process_row(&row);
-                            } else {
-                                warn!("Wrong number of columns (expected: {}, provided: {}). The line [{}] is skipped.", config_col_num, line_col_num, line);
+            let file_reading_worker_num = min(4, config.input.len());
+
+            for _ in 0..file_reading_worker_num {
+                let hashes_s = sender_main.clone();
+                let files_r = files_r.clone();
+                let entity_processor = EntityProcessor::new(
+                    config,
+                    in_memory_entity_mapping_persistor.clone(),
+                    move |hashes| {
+                        hashes_s.send(hashes).unwrap();
+                    },
+                );
+
+                match &config.file_type {
+                    FileType::Json => {
+                        s.spawn(move |_| {
+                            let mut parser = dom::Parser::default();
+
+                            for input in files_r {
+                                read_file(input, config.log_every_n as u64, |line| {
+                                    let row = parse_json_line(line, &mut parser, &config.columns);
+                                    entity_processor.process_row(&row);
+                                })
                             }
                         });
-                    });
+                    }
+                    FileType::Tsv => {
+                        let config_col_num = config.columns.len();
+                        s.spawn(move |_| {
+                            for input in files_r {
+                                read_file(input, config.log_every_n as u64, |line| {
+                                    let row = parse_tsv_line(line);
+                                    let line_col_num = row.len();
+                                    if line_col_num == config_col_num {
+                                        entity_processor.process_row(&row);
+                                    } else {
+                                        warn!("Wrong number of columns (expected: {}, provided: {}). The line [{}] is skipped.", config_col_num, line_col_num, line);
+                                    }
+                                });
+                            }
+                        });
+                    }
                 }
             }
         }
