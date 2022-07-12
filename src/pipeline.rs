@@ -31,18 +31,24 @@ pub fn build_graphs(
     let sparse_matrices_ref = &sparse_matrices;
 
     cb_thread::scope(|s| {
-        // Important to have large buffer. Cartesian-product iterator yields a lot of items very fast
-        // and we can easily loose performance on locking there
-        let (sender_main, receiver_main) = channel::bounded(8192);
-
         let processing_worker_num = num_cpus::get();
+
+        let (hyperedges_s, hyperedges_r) = channel::bounded(processing_worker_num * 16);
+
         for _ in 0..processing_worker_num {
-            let receiver = receiver_main.clone();
+            let receiver = hyperedges_r.clone();
+            let entity_processor = EntityProcessor::new(
+                config,
+                in_memory_entity_mapping_persistor.clone(),
+            );
+
             s.spawn(move |_| {
-                for hashes in receiver {
-                    let hashes: SmallVec<[u64; SMALL_VECTOR_SIZE]> = hashes;
-                    for sparse_matrix in sparse_matrices_ref {
-                        sparse_matrix.handle_pair(&hashes)
+                for row in receiver {
+                    let row: Vec<SmallVec<[_; SMALL_VECTOR_SIZE]>> = row;
+                    for hashes in entity_processor.process_row_and_get_edges(&row) {
+                        for sparse_matrix in sparse_matrices_ref {
+                            sparse_matrix.handle_pair(&hashes)
+                        }
                     }
                 }
             });
@@ -57,15 +63,8 @@ pub fn build_graphs(
             let file_reading_worker_num = min(4, config.input.len());
 
             for _ in 0..file_reading_worker_num {
-                let hashes_s = sender_main.clone();
+                let row_s = hyperedges_s.clone();
                 let files_r = files_r.clone();
-                let entity_processor = EntityProcessor::new(
-                    config,
-                    in_memory_entity_mapping_persistor.clone(),
-                    move |hashes| {
-                        hashes_s.send(hashes).unwrap();
-                    },
-                );
 
                 match &config.file_type {
                     FileType::Json => {
@@ -75,7 +74,7 @@ pub fn build_graphs(
                             for input in files_r {
                                 read_file(input, config.log_every_n as u64, |line| {
                                     let row = parse_json_line(line, &mut parser, &config.columns);
-                                    entity_processor.process_row(&row);
+                                    row_s.send(row).unwrap();
                                 })
                             }
                         });
@@ -88,7 +87,7 @@ pub fn build_graphs(
                                     let row = parse_tsv_line(line);
                                     let line_col_num = row.len();
                                     if line_col_num == config_col_num {
-                                        entity_processor.process_row(&row);
+                                        row_s.send(row).unwrap();
                                     } else {
                                         warn!("Wrong number of columns (expected: {}, provided: {}). The line [{}] is skipped.", config_col_num, line_col_num, line);
                                     }
@@ -101,8 +100,8 @@ pub fn build_graphs(
         }
 
         // Drop it so all channels are closed when work is finished
-        drop(sender_main);
-        drop(receiver_main);
+        drop(hyperedges_s);
+        drop(hyperedges_r);
     }).expect("Threads finished work");
 
     sparse_matrices
@@ -182,9 +181,11 @@ fn parse_json_line(
 }
 
 /// Parse a line of TSV and read its columns into a vector for processing.
-fn parse_tsv_line(line: &str) -> Vec<SmallVec<[&str; SMALL_VECTOR_SIZE]>> {
+fn parse_tsv_line(line: &str) -> Vec<SmallVec<[String; SMALL_VECTOR_SIZE]>> {
     let values = line.trim().split('\t');
-    values.map(|c| c.split(' ').collect()).collect()
+    values
+        .map(|c| c.split(' ').map(|s| s.to_owned()).collect())
+        .collect()
 }
 
 /// Train SparseMatrix'es (graphs) in separated threads.
